@@ -1,7 +1,9 @@
 """Contract and regression tests for the multi-target-only review service."""
 
 import base64
+import io
 import tempfile
+import threading
 import unittest
 import uuid
 from pathlib import Path
@@ -265,6 +267,105 @@ class Tests(unittest.TestCase):
                 self.assertEqual(summary["done_count"], 0)
                 self.assertIsNone(controller.publish_native_report(
                     CompletedGmp(), group))
+            finally:
+                controller.DB = original_db
+
+
+    def test_mutation_loads_group_after_acquiring_lock(self):
+        lock = threading.Lock()
+        original = (controller.MUTATION_LOCK, controller.manager,
+                    controller.group_by_id, controller.start_group)
+
+        class Manager:
+            def __enter__(self):
+                return object()
+            def __exit__(self, *_):
+                return False
+
+        class Request:
+            path = f"/api/groups/{TARGET_A}/start"
+            headers = {"Content-Length": "2"}
+            rfile = io.BytesIO(b"{}")
+            status = None
+            def _authorized(self):
+                return True
+            def _send(self, status, _result):
+                self.status = status
+
+        def load_group(_group_id):
+            self.assertTrue(lock.locked())
+            return {"id": TARGET_A}
+
+        try:
+            controller.MUTATION_LOCK = lock
+            controller.manager = Manager
+            controller.group_by_id = load_group
+            controller.start_group = lambda *_: {"started": []}
+            request = Request()
+            controller.Handler.do_POST(request)
+            self.assertEqual(request.status, 200)
+        finally:
+            (controller.MUTATION_LOCK, controller.manager,
+             controller.group_by_id, controller.start_group) = original
+
+    def test_cve_scanner_is_rejected_before_any_child_is_created(self):
+        class CveGmp(FakeGmp):
+            def get_scanners(self, **_):
+                return (f'<get_scanners_response status="200"><scanner id="{SCANNER}">'
+                        '<type>3</type></scanner></get_scanners_response>')
+
+        with self.assertRaisesRegex(controller.ReviewError, "CVE scanners"):
+            controller.build_plan(CveGmp(), self.request())
+
+    def test_native_in_use_states_block_restart(self):
+        class BusyGmp(CompletedGmp):
+            status = "Processing"
+            def get_task(self, task_id):
+                return (f'<get_tasks_response status="200"><task id="{task_id}">'
+                        f'<status>{self.status}</status></task></get_tasks_response>')
+
+        original_db = controller.DB
+        with tempfile.TemporaryDirectory() as directory:
+            controller.DB = Path(directory) / "groups.sqlite"
+            try:
+                controller.init_db()
+                controller.save_group(TARGET_A, {"name": "Review"},
+                                      [{"host": "192.0.2.1", "task_id": TASK_A,
+                                        "target_id": TARGET_A}], SCANNER)
+                gmp = BusyGmp()
+                for status in ("Processing", "Stop Requested", "Stop Waiting",
+                               "Delete Requested"):
+                    gmp.status = status
+                    with self.assertRaisesRegex(controller.ReviewError, "active host scans"):
+                        controller.start_group(gmp, controller.group_by_id(TARGET_A))
+                    self.assertIsNone(controller.group_by_id(TARGET_A)["run_state"])
+            finally:
+                controller.DB = original_db
+
+    def test_interrupted_launch_recovers_only_fully_recorded_reports(self):
+        children = [{"host": "192.0.2.1", "task_id": TASK_A, "target_id": TARGET_A},
+                    {"host": "192.0.2.4", "task_id": TASK_B, "target_id": TARGET_B}]
+        original_db = controller.DB
+        with tempfile.TemporaryDirectory() as directory:
+            controller.DB = Path(directory) / "groups.sqlite"
+            try:
+                controller.init_db()
+                controller.save_group(TARGET_A, {"name": "Review"}, children, SCANNER)
+                controller.save_run_state(TARGET_A, {
+                    "id": str(uuid.uuid4()), "state": "starting",
+                    "reports": {TASK_A: REPORT_A, TASK_B: REPORT_B}, "failed": []})
+                recovered = controller.recover_starting_run(
+                    controller.group_by_id(TARGET_A))
+                self.assertEqual(recovered["run_state"]["state"], "active")
+                self.assertEqual(controller.group_summary(CompletedGmp(), recovered)["status"], "Done")
+                controller.save_run_state(TARGET_A, {
+                    "id": str(uuid.uuid4()), "state": "starting",
+                    "reports": {TASK_A: REPORT_A}, "failed": []})
+                recovered = controller.recover_starting_run(
+                    controller.group_by_id(TARGET_A))
+                self.assertEqual(recovered["run_state"]["state"], "failed")
+                self.assertIn(TASK_B, recovered["run_state"]["failed"][0]["task_id"])
+                self.assertIsNone(controller.publish_native_report(CompletedGmp(), recovered))
             finally:
                 controller.DB = original_db
 
