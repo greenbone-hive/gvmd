@@ -52,6 +52,10 @@ REPORT_PAGE_SIZE = 100
 CSV_RESULT_LIMIT = 5000
 NATIVE_REPORT_RESULT_LIMIT = 10000
 NATIVE_REPORT_XML_LIMIT = 25 * 1024 * 1024
+ACTIVE_TASK_STATUSES = {"Requested", "Running", "Queued", "Stop Requested",
+                        "Stop Waiting", "Processing", "Delete Requested",
+                        "Delete Waiting", "Ultimate Delete Requested",
+                        "Ultimate Delete Waiting"}
 
 
 class ReviewError(ValueError):
@@ -190,6 +194,9 @@ def build_plan(gmp, request: dict, *, require_scan_setup: bool = True,
     for collection, item_id in (("configs", config_id), ("scanners", scanner_id)):
         if item_id and item_id not in {entry["id"] for entry in inv[collection]}:
             raise ReviewError(f"Selected {collection[:-1]} is unavailable")
+    if scanner_id and any(entry["id"] == scanner_id and entry["type"] == "3"
+                          for entry in inv["scanners"]):
+        raise ReviewError("CVE scanners cannot provide trackable child report IDs")
     available_creds = {entry["id"] for entry in inv["credentials"]}
     asset_hosts = {}
     for entry in inv["assets"]:
@@ -409,6 +416,27 @@ def save_run_state(group_id: str, run_state: dict):
             raise ReviewError("Unknown scan group")
 
 
+def recover_starting_run(group: dict) -> dict:
+    """Recover a launch interrupted after its state was saved to disk."""
+    run_state = group.get("run_state")
+    if not run_state or run_state.get("state") != "starting":
+        return group
+    child_ids = {child["task_id"] for child in group["children"]}
+    reports = run_state.get("reports", {})
+    run_state = copy.deepcopy(run_state)
+    if (set(reports) == child_ids and
+            all(UUID_RE.fullmatch(report_id) for report_id in reports.values())):
+        run_state["state"] = "active"
+    else:
+        run_state["state"] = "failed"
+        run_state["failed"] = run_state.get("failed", []) + [{
+            "task_id": child_id,
+            "error": "Controller interrupted while starting scans; inspect child tasks before retrying"}
+            for child_id in sorted(child_ids - set(reports) or child_ids)]
+    save_run_state(group["id"], run_state)
+    return {**group, "run_state": run_state}
+
+
 def create_native_task(gmp, group: dict) -> str:
     """Create the normal gvmd task record used as the logical scan entry."""
     command = ("<create_task><target id=\"0\"/>"
@@ -520,6 +548,7 @@ def publish_native_report(gmp, group: dict) -> dict | None:
     Source reports remain authoritative: GMP import does not preserve every
     internal relation, so this review path has a strict size limit.
     """
+    group = recover_starting_run(group)
     summary = group_summary(gmp, group)
     if group.get("run_state") and group["run_state"]["state"] != "active":
         return None
@@ -750,8 +779,9 @@ def create_group(gmp, plan: dict) -> dict:
 
 
 def start_group(gmp, group: dict) -> dict:
+    group = recover_starting_run(group)
     summary = group_summary(gmp, group)
-    if any(child["status"] in ("Running", "Requested", "Queued")
+    if any(child["status"] in ACTIVE_TASK_STATUSES
            for child in summary["children"]):
         raise ReviewError("This multi-target task already has active host scans")
     started, failed = [], []
@@ -916,8 +946,8 @@ class Handler(BaseHTTPRequestHandler):
                     delete_asset_override(body.get("asset_id"), body.get("service"))
                     result = {"deleted": True}
             elif re.fullmatch(r"/api/groups/[0-9a-fA-F-]{36}/(?:start|stop|publish)", self.path):
-                group = group_by_id(self.path.split("/")[3])
                 with MUTATION_LOCK, manager() as gmp:
+                    group = group_by_id(self.path.split("/")[3])
                     if self.path.endswith("/start"):
                         result = start_group(gmp, group)
                     elif self.path.endswith("/stop"):
