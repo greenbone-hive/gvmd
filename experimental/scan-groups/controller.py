@@ -33,8 +33,8 @@ from gvm.protocols.gmp import GMP
 
 SOCKET = os.environ.get("GMP_SOCKET", "/run/gvmd/gvmd.sock")
 DB = Path(os.environ.get("REVIEW_DB", "/var/lib/credential-review/groups.sqlite"))
-USERNAME = os.environ.get("REVIEW_USERNAME", "admin")
-PASSWORD = os.environ.get("REVIEW_PASSWORD", "admin")
+USERNAME = os.environ.get("REVIEW_USERNAME", "")
+PASSWORD = os.environ.get("REVIEW_PASSWORD", "")
 GMP_USERNAME = os.environ.get("GMP_USERNAME", "admin")
 GMP_PASSWORD = os.environ.get("GMP_PASSWORD", "admin")
 TRUST_GSA_PROXY = os.environ.get("TRUST_GSA_PROXY", "0") == "1"
@@ -102,6 +102,12 @@ def split_hosts(raw: str) -> list[str]:
     hosts = [host_key(h) for h in raw.split(",") if h.strip()]
     if not hosts or len(hosts) > 128:
         raise ReviewError("Each source target must contain 1–128 explicit hosts")
+    for host in hosts:
+        try:
+            ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise ReviewError(
+                f"DNS source host {host!r} is not supported until report IP mapping is available") from exc
     if len(set(hosts)) != len(hosts):
         raise ReviewError("Duplicate host in source target")
     return hosts
@@ -331,6 +337,8 @@ def init_db():
             db.execute("ALTER TABLE groups ADD COLUMN native_task_id TEXT")
         if "native_error" not in group_columns:
             db.execute("ALTER TABLE groups ADD COLUMN native_error TEXT")
+        if "run_state" not in group_columns:
+            db.execute("ALTER TABLE groups ADD COLUMN run_state TEXT")
         db.execute("CREATE TABLE IF NOT EXISTS native_reports (group_id TEXT NOT NULL, signature TEXT NOT NULL, report_id TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(group_id, signature), UNIQUE(report_id))")
         db.execute("CREATE TABLE IF NOT EXISTS asset_overrides (asset_id TEXT NOT NULL, service TEXT NOT NULL, credential_id TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(asset_id, service))")
         columns = {row[1] for row in db.execute("PRAGMA table_info(asset_overrides)")}
@@ -387,10 +395,18 @@ def save_group(group_id, plan, children, native_task_id):
 
 def get_groups():
     with sqlite3.connect(DB) as db:
-        rows = db.execute("SELECT id, name, plan, children, native_task_id, native_error FROM groups ORDER BY rowid DESC").fetchall()
+        rows = db.execute("SELECT id, name, plan, children, native_task_id, native_error, run_state FROM groups ORDER BY rowid DESC").fetchall()
     return [{"id": row[0], "name": row[1], "plan": json.loads(row[2]),
              "children": json.loads(row[3]), "native_task_id": row[4],
-             "native_error": row[5]} for row in rows]
+             "native_error": row[5],
+             "run_state": json.loads(row[6]) if row[6] else None} for row in rows]
+
+
+def save_run_state(group_id: str, run_state: dict):
+    with sqlite3.connect(DB) as db:
+        if db.execute("UPDATE groups SET run_state=? WHERE id=?",
+                      (json.dumps(run_state), group_id)).rowcount != 1:
+            raise ReviewError("Unknown scan group")
 
 
 def create_native_task(gmp, group: dict) -> str:
@@ -441,6 +457,8 @@ def group_by_id(group_id: str) -> dict:
 def group_summary(gmp, group: dict) -> dict:
     """Describe one logical group while retaining native task/report identities."""
     children = []
+    run_state = group.get("run_state")
+    expected_reports = (run_state or {}).get("reports", {})
     for child in group["children"]:
         hosts = child.get("hosts") or [child["host"]]
         entry = {"host": ", ".join(hosts), "hosts": hosts, "task_id": child["task_id"],
@@ -454,11 +472,17 @@ def group_summary(gmp, group: dict) -> dict:
             last_report = task.find("./last_report/report")
             if last_report is not None and last_report.get("id"):
                 entry["report_id"] = require_uuid(last_report.get("id"))
+            if run_state and entry["report_id"] != expected_reports.get(child["task_id"]):
+                entry["report_id"] = None
+                entry["error"] = "No completed report for the current run"
         except (ReviewError, ValueError, ET.ParseError) as exc:
             entry["error"] = str(exc)
         children.append(entry)
     statuses = [child["status"] for child in children]
-    if statuses and all(status == "Done" for status in statuses):
+    if run_state and run_state["state"] != "active":
+        status = "Attention needed" if run_state["state"] == "failed" else "Running"
+    elif (statuses and all(status == "Done" for status in statuses)
+          and all(child["report_id"] for child in children)):
         status = "Done"
     elif statuses and all(status == "New" for status in statuses):
         status = "New"
@@ -472,10 +496,12 @@ def group_summary(gmp, group: dict) -> dict:
     return {"id": group["id"], "name": group["name"], "status": status,
             "native_task_id": group.get("native_task_id"),
             "native_report_id": native_report["id"] if native_report else None,
-            "native_error": group.get("native_error"),
+            "native_error": group.get("native_error") or
+                            "; ".join(item["error"] for item in run_state.get("failed", []))
+                            if run_state else group.get("native_error"),
             "host_count": sum(len(child["hosts"]) for child in children),
             "done_count": sum(len(child["hosts"]) for child in children
-                              if child["status"] == "Done"),
+                              if child["status"] == "Done" and child["report_id"]),
             "report_count": sum(bool(child["report_id"]) for child in children),
             "children": children}
 
@@ -495,6 +521,8 @@ def publish_native_report(gmp, group: dict) -> dict | None:
     internal relation, so this review path has a strict size limit.
     """
     summary = group_summary(gmp, group)
+    if group.get("run_state") and group["run_state"]["state"] != "active":
+        return None
     if summary["status"] != "Done" or summary["report_count"] != len(summary["children"]):
         return None
     signature = report_signature(summary)
@@ -517,13 +545,14 @@ def publish_native_report(gmp, group: dict) -> dict | None:
             raise ReviewError(f"Native source report {child['report_id']} is incomplete")
         expected_hosts = set(child["hosts"])
         report_hosts = inner.findall("./host")
-        if not report_hosts or any(host.findtext("ip") not in expected_hosts
-                                   for host in report_hosts):
+        source_results = inner.findall("./results/result")
+        if (not report_hosts and source_results) or any(
+                host.findtext("ip") not in expected_hosts for host in report_hosts):
             raise ReviewError(f"Source host metadata for {child['host']} is incomplete")
         if any(result.findtext("host") not in expected_hosts
-               for result in inner.findall("./results/result")):
+               for result in source_results):
             raise ReviewError(f"Source results contain a host outside {child['host']}")
-        result_total += len(inner.findall("./results/result"))
+        result_total += len(source_results)
         if result_total > NATIVE_REPORT_RESULT_LIMIT:
             raise ReviewError("Native review import exceeds 10000 results; host reports remain available")
         sources.append((child, inner))
@@ -619,6 +648,7 @@ def group_report(gmp, group: dict, *, offset: int = 0,
         report_id = child["report_id"]
         if report_id is None:
             child["result_count"] = 0
+            child.setdefault("error", "A child report is unavailable")
             continue
         try:
             count = result_count(gmp, report_id)
@@ -640,7 +670,8 @@ def group_report(gmp, group: dict, *, offset: int = 0,
         skipped = 0
     summary.update({"result_count": total, "offset": offset, "limit": limit,
                     "results": results, "filter": REPORT_FILTER,
-                    "complete": not any(child.get("error") for child in summary["children"])})
+                    "complete": summary["status"] == "Done" and
+                                not any(child.get("error") for child in summary["children"])})
     return summary
 
 
@@ -724,12 +755,21 @@ def start_group(gmp, group: dict) -> dict:
            for child in summary["children"]):
         raise ReviewError("This multi-target task already has active host scans")
     started, failed = [], []
+    run_state = {"id": str(uuid.uuid4()), "state": "starting", "reports": {}, "failed": []}
+    with sqlite3.connect(DB) as db:
+        db.execute("UPDATE groups SET native_error=NULL WHERE id=?", (group["id"],))
+    save_run_state(group["id"], run_state)
     for child in group["children"]:
         try:
-            check_response(gmp.start_task(child["task_id"]))
+            response = check_response(gmp.start_task(child["task_id"]))
+            run_state["reports"][child["task_id"]] = require_uuid(response.findtext("report_id"))
+            save_run_state(group["id"], run_state)
             started.append(child["task_id"])
         except Exception as exc:
             failed.append({"task_id": child["task_id"], "error": str(exc)})
+    run_state["failed"] = failed
+    run_state["state"] = "failed" if failed else "active"
+    save_run_state(group["id"], run_state)
     return {"started": started, "failed": failed}
 
 
@@ -752,19 +792,23 @@ class Handler(BaseHTTPRequestHandler):
         # nginx alone sets this header after an auth_request against the
         # existing GSAD session. The controller has no published port when
         # proxy authentication is enabled in the integrated review stack.
-        if TRUST_GSA_PROXY:
-            if self.headers.get("X-Review-Authenticated") == "1":
-                return True
+        if not USERNAME or not PASSWORD:
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return False
+        if TRUST_GSA_PROXY and self.headers.get("X-Review-Authenticated") != "1":
             self.send_response(401)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return False
-        auth = self.headers.get("Authorization", "")
+        auth = self.headers.get(
+            "X-Review-Operator-Authorization" if TRUST_GSA_PROXY else "Authorization", "")
         expected = "Basic " + base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
         if hmac.compare_digest(auth, expected):
             return True
         self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="Credential review"')
+        self.send_header("WWW-Authenticate", 'Basic realm="Scan group operator"')
         self.send_header("Content-Length", "0")
         self.end_headers()
         return False

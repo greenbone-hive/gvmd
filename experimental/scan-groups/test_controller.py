@@ -1,3 +1,4 @@
+import base64
 import sqlite3
 import tempfile
 import unittest
@@ -289,6 +290,54 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(controller.ReviewError, "explicit IPs"):
             controller.build_plan(CidrGmp(), self.request())
 
+    def test_dns_source_rejected_before_credentials_are_routed(self):
+        class DnsGmp(FakeGmp):
+            def get_target(self, target_id):
+                return super().get_target(target_id).replace(
+                    "192.0.2.1,192.0.2.55", "scan.example.test,192.0.2.55")
+
+        with self.assertRaisesRegex(controller.ReviewError, "DNS source host"):
+            controller.build_plan(DnsGmp(), self.request())
+
+    def test_proxy_requires_configured_operator_credentials(self):
+        class Request:
+            def __init__(self, headers):
+                self.headers = headers
+                self.status = None
+
+            def send_response(self, status):
+                self.status = status
+
+            def send_header(self, *_):
+                pass
+
+            def end_headers(self):
+                pass
+
+        original = (controller.USERNAME, controller.PASSWORD, controller.TRUST_GSA_PROXY)
+        try:
+            controller.TRUST_GSA_PROXY = True
+            controller.USERNAME = "operator"
+            controller.PASSWORD = "review-secret"
+            valid = "Basic " + base64.b64encode(b"operator:review-secret").decode()
+            for headers in ({"X-Review-Authenticated": "1"},
+                            {"X-Review-Authenticated": "1",
+                             "X-Review-Operator-Authorization": "Basic wrong"},
+                            {"X-Review-Operator-Authorization": valid}):
+                request = Request(headers)
+                self.assertFalse(controller.Handler._authorized(request))
+                self.assertEqual(request.status, 401)
+            self.assertTrue(controller.Handler._authorized(Request({
+                "X-Review-Authenticated": "1",
+                "X-Review-Operator-Authorization": valid})))
+            controller.PASSWORD = ""
+            request = Request({"X-Review-Authenticated": "1",
+                               "X-Review-Operator-Authorization": valid})
+            self.assertFalse(controller.Handler._authorized(request))
+            self.assertEqual(request.status, 503)
+        finally:
+            controller.USERNAME, controller.PASSWORD, controller.TRUST_GSA_PROXY = original
+
     def test_numeric_host_range_rejected(self):
         with self.assertRaises(controller.ReviewError):
             controller.host_key("192.0.2.1-55")
@@ -413,6 +462,98 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual([host.findtext("ip") for host in body.findall("host")],
                                  ["192.0.2.1", "192.0.2.2"])
                 self.assertEqual(len(body.findall("./results/result")), 2)
+            finally:
+                controller.DB = original_db
+
+    def test_failed_restart_never_combines_or_exports_stale_reports(self):
+        class PartiallyStartingGmp(FakeReportGmp):
+            def start_task(self, task_id):
+                if task_id == TASK_B:
+                    raise controller.ReviewError("Second child could not start")
+                return (f'<start_task_response status="202"><report_id>'
+                        f'{REPORT_A}</report_id></start_task_response>')
+
+        original_db = controller.DB
+        with tempfile.TemporaryDirectory() as directory:
+            controller.DB = Path(directory) / "groups.sqlite"
+            try:
+                controller.init_db()
+                children = [
+                    {"host": "192.0.2.1", "task_id": TASK_A, "target_id": TARGET},
+                    {"host": "192.0.2.2", "task_id": TASK_B, "target_id": PORTS},
+                ]
+                controller.save_group(TARGET, {"name": "Review"}, children, SCANNER)
+                gmp = PartiallyStartingGmp()
+                result = controller.start_group(gmp, controller.group_by_id(TARGET))
+                self.assertEqual(result["started"], [TASK_A])
+                self.assertEqual(len(result["failed"]), 1)
+                group = controller.group_by_id(TARGET)
+                self.assertEqual(group["run_state"]["state"], "failed")
+                self.assertIsNone(controller.publish_native_report(gmp, group))
+                self.assertFalse(controller.group_report(gmp, group)["complete"])
+                with self.assertRaisesRegex(controller.ReviewError, "incomplete"):
+                    controller.group_report_csv(gmp, group)
+            finally:
+                controller.DB = original_db
+
+    def test_empty_source_report_does_not_block_combined_import(self):
+        class EmptySourceGmp(FakeReportGmp):
+            imported = ""
+
+            def get_report(self, report_id, **_):
+                host = "192.0.2.2" if report_id == REPORT_B else None
+                host_xml = f'<host><ip>{host}</ip></host>' if host else ''
+                result_xml = (f'<result id="{TASK_B}"><host>{host}</host></result>'
+                              if host else '')
+                return (f'<get_reports_response status="200"><report><report>'
+                        f'<scan_start>2026-10-16T01:00:00Z</scan_start>{host_xml}'
+                        f'<results>{result_xml}</results>'
+                        f'<scan_end>2026-10-16T01:01:00Z</scan_end>'
+                        '</report></report></get_reports_response>')
+
+            def send_command(self, command):
+                self.imported = command
+                return f'<create_report_response status="201" id="{REPORT_A}"/>'
+
+        original_db = controller.DB
+        with tempfile.TemporaryDirectory() as directory:
+            controller.DB = Path(directory) / "groups.sqlite"
+            try:
+                controller.init_db()
+                children = [
+                    {"host": "192.0.2.1", "task_id": TASK_A, "target_id": TARGET},
+                    {"host": "192.0.2.2", "task_id": TASK_B, "target_id": PORTS},
+                ]
+                controller.save_group(TARGET, {"name": "Review"}, children, SCANNER)
+                gmp = EmptySourceGmp()
+                self.assertIsNotNone(controller.publish_native_report(
+                    gmp, controller.group_by_id(TARGET)))
+                self.assertEqual(len(ET.fromstring(gmp.imported).findall("./report/results/result")), 1)
+            finally:
+                controller.DB = original_db
+
+
+    def test_current_run_rejects_previous_report_ids(self):
+        original_db = controller.DB
+        with tempfile.TemporaryDirectory() as directory:
+            controller.DB = Path(directory) / "groups.sqlite"
+            try:
+                controller.init_db()
+                children = [{"host": "192.0.2.1", "task_id": TASK_A,
+                             "target_id": TARGET}]
+                controller.save_group(TARGET,
+                                      {"name": "Review"}, children, SCANNER)
+                controller.save_run_state(TARGET, {
+                    "id": str(uuid.uuid4()), "state": "active",
+                    "reports": {TASK_A: "00000000-0000-4000-8000-000000000001"},
+                    "failed": []})
+                group = controller.group_by_id(TARGET)
+                summary = controller.group_summary(FakeReportGmp(), group)
+                self.assertNotEqual(summary["status"], "Done")
+                self.assertEqual(summary["report_count"], 0)
+                self.assertEqual(summary["done_count"], 0)
+                self.assertIsNone(controller.publish_native_report(
+                    FakeReportGmp(), group))
             finally:
                 controller.DB = original_db
 
