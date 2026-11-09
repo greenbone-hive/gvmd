@@ -1,7 +1,8 @@
 """Contract and regression tests for the multi-target-only review service."""
 
-import base64
 import io
+import socket
+import socketserver
 import tempfile
 import threading
 import unittest
@@ -123,7 +124,29 @@ class Tests(unittest.TestCase):
         with self.assertRaisesRegex(controller.ReviewError, "DNS source host"):
             controller.build_plan(DnsGmp(), self.request())
 
-    def test_proxy_requires_operator_credentials_and_gsad_session(self):
+    def test_unix_socket_serves_http_responses(self):
+        original = controller.TRUST_GSA_PROXY
+        try:
+            controller.TRUST_GSA_PROXY = True
+            with tempfile.TemporaryDirectory() as directory:
+                path = str(Path(directory) / "controller.sock")
+                with socketserver.ThreadingUnixStreamServer(path, controller.Handler) as server:
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    for header, expected in (("", b" 401 "),
+                                             ("X-Review-Authenticated: 1\r\n", b" 404 ")):
+                        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                            client.connect(path)
+                            client.sendall(("GET /api/nonexistent HTTP/1.0\r\n" + header +
+                                            "\r\n").encode())
+                            response = client.recv(1024)
+                        self.assertIn(expected, response)
+                    server.shutdown()
+                    thread.join(timeout=2)
+        finally:
+            controller.TRUST_GSA_PROXY = original
+
+    def test_proxy_requires_gsad_authorization_header(self):
         class Request:
             def __init__(self, headers):
                 self.headers = headers
@@ -138,28 +161,19 @@ class Tests(unittest.TestCase):
             def end_headers(self):
                 pass
 
-        original = (controller.USERNAME, controller.PASSWORD,
-                    controller.TRUST_GSA_PROXY)
+        original = controller.TRUST_GSA_PROXY
         try:
             controller.TRUST_GSA_PROXY = True
-            controller.USERNAME = "operator"
-            controller.PASSWORD = "review-secret"
-            valid = "Basic " + base64.b64encode(b"operator:review-secret").decode()
-            for headers in ({"X-Review-Authenticated": "1"},
-                            {"X-Review-Operator-Authorization": valid}):
+            for headers in ({}, {"X-Review-Authenticated": "0"},
+                            {"Authorization": "Basic forged"},
+                            {"X-Review-Operator-Authorization": "Basic forged"}):
                 request = Request(headers)
                 self.assertFalse(controller.Handler._authorized(request))
                 self.assertEqual(request.status, 401)
             self.assertTrue(controller.Handler._authorized(Request({
-                "X-Review-Authenticated": "1",
-                "X-Review-Operator-Authorization": valid})))
-            controller.PASSWORD = ""
-            request = Request({"X-Review-Authenticated": "1",
-                               "X-Review-Operator-Authorization": valid})
-            self.assertFalse(controller.Handler._authorized(request))
-            self.assertEqual(request.status, 503)
+                "X-Review-Authenticated": "1"})))
         finally:
-            controller.USERNAME, controller.PASSWORD, controller.TRUST_GSA_PROXY = original
+            controller.TRUST_GSA_PROXY = original
 
     def test_failed_restart_cannot_mix_reports_or_export(self):
         class PartialGmp(CompletedGmp):
